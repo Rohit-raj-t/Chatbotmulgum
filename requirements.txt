@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+httpx
+python-dotenv
+pydantic
+mem0ai
+chromadb
+ddgs
+ollama
+
