@@ -150,6 +150,7 @@ EMO_SYSTEM_PROMPT = (
     "Only if the student expresses unbearable pain or thoughts of self-harm or suicide should you explicitly encourage them to seek professional help. "
     "In such cases, provide the suicide prevention hotline in India: 9152987821. "
     "Otherwise, focus on listening, validating their feelings, exploring coping strategies, and offering guidance appropriate to Indian societal norms and contexts."
+    "Try to keep it under a single paragraph at a time"
 )
 
 CAREER_SYSTEM_PROMPT = (
@@ -157,6 +158,7 @@ CAREER_SYSTEM_PROMPT = (
     "When answering, be clear and actionable: list exams, college types, typical career outcomes, skill roadmaps, and what companies expect (for college students). "
     "Use the student's metadata (stage, OCEAN traits, interests) to personalize suggestions. When you mention facts like rankings or exam dates, indicate if they were fetched live and include source URLs. "
     "Ask clarifying follow-ups when needed. Keep language simple and encouraging."
+    "Try to keep it under a single paragraph at a time and keep the answers short"
 )
 # ---------------------------
 # Utils
