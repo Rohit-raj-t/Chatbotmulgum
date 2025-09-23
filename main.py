@@ -389,481 +389,247 @@ def health():
 # ---------------------------
 # Improved OCEAN Test endpoint
 # ---------------------------
+# ---------------------------
+# Improved OCEAN Test endpoint (robust, LLM-enrichment for missing fields)
+# ---------------------------
 @app.post("/oceantest", response_model=OceanTestResponse)
 async def ocean_test_recommendations(data: OceanTestRequest):
     """
-    Improved OCEAN Test endpoint:
-    - stage accepts: "10th" / "10th and below", "12th" / "12th and below" (covers 11th/12th), "college"
-    - Returns a JSON array (>=10 objects) tailored to the stage:
-      * 10th: best streams (PCM-CS, BIO-Maths, Commerce, Arts, Vocational...) with Overview, Key Skills, Career Paths, Future Scope
-      * 12th: same + Curriculum (year-wise where applicable), Top Colleges in India, Career Opportunities, Eligibility
-      * college: career-focused entries (job/role) with roles, skills, top companies and typical pathways
+    Take OCEAN test scores, stage, and interests, and return top 10 recommendations.
+    - 10th and below -> streams with core_subjects
+    - 12th and below -> courses with curriculum, colleges, eligibility
+    - college -> careers/jobs with roles, companies, eligibility
     """
-    import json
-
+    import re, json
     logger.info("Received oceantest request for user=%s stage=%s", data.user_id, data.stage)
 
-    # --- Normalize + validate OCEAN scores ---
-    raw_ocean = {k.lower(): float(v) for k, v in (data.ocean_scores or {}).items()}
-    expected = {"openness", "conscientiousness", "extraversion", "agreeableness", "neuroticism"}
-    for trait in expected:
+    # -------------------- Normalize OCEAN scores --------------------
+    raw_ocean = {}
+    for k, v in (data.ocean_scores or {}).items():
+        try:
+            raw_ocean[str(k).lower()] = float(v)
+        except Exception:
+            raw_ocean[str(k).lower()] = 0.0
+
+    for trait in ("openness", "conscientiousness", "extraversion", "agreeableness", "neuroticism"):
         raw_ocean.setdefault(trait, 0.0)
+    # map shorthand O C E A N
+    mapping = {"o": "openness", "c": "conscientiousness", "e": "extraversion", "a": "agreeableness", "n": "neuroticism"}
+    for short, full in mapping.items():
+        if short in raw_ocean and raw_ocean.get(full, 0.0) == 0.0:
+            raw_ocean[full] = raw_ocean[short]
+    # clamp to [0,10]
     for k in list(raw_ocean.keys()):
         try:
-            val = float(raw_ocean[k])
-            raw_ocean[k] = max(0.0, min(10.0, val))
+            raw_ocean[k] = max(0.0, min(10.0, float(raw_ocean[k])))
         except Exception:
             raw_ocean[k] = 0.0
 
-    interests = [i.lower() for i in (data.interests or [])]
-    interests_text = ", ".join(data.interests or []) if data.interests else "not specified"
-
-    # Stage classification
+    interests = [str(i).strip() for i in (data.interests or [])]
+    interests_blob = " ".join(i.lower() for i in interests)
     stage_raw = (data.stage or "").strip().lower()
-    if any(tok in stage_raw for tok in ("10th", "10", "10th and below", "secondary", "ssc")):
-        stage_key = "10th"
-    elif any(tok in stage_raw for tok in ("12th", "11th", "11", "12", "12th and below", "higher secondary", "hsc")):
-        stage_key = "12th"
-    elif "college" in stage_raw or "undergrad" in stage_raw or "btech" in stage_raw:
-        stage_key = "college"
-    else:
-        # default to 12th-style guidance if unclear
-        stage_key = "12th"
 
-    # Helpers to pick suggestions based on interests + dominant traits
-    top_trait = max(raw_ocean.items(), key=lambda x: x[1])[0]
+    # -------------------- Normalize stage --------------------
+    def normalize_stage(s: str) -> str:
+        if not s:
+            return "12th"
+        if any(tok in s for tok in ("10", "10th", "ssc", "secondary", "class 10", "class10")):
+            return "10th"
+        if any(tok in s for tok in ("11", "11th", "12", "12th", "hsc", "higher secondary", "class 11", "class 12", "12th and below")):
+            return "12th"
+        if any(tok in s for tok in ("college", "undergrad", "btech", "b.e", "ba", "bsc", "b.com")):
+            return "college"
+        if s.isdigit():
+            return "10th" if int(s) <= 10 else "12th"
+        return "12th"
 
-    def interest_matches(*keys):
-        blob = " ".join(interests)
-        return any(k in blob for k in keys)
+    stage_key = normalize_stage(stage_raw)
 
-    # --- Generators for each stage ---
-    def generate_for_10th():
-        """
-        Return 10 stream suggestions. Each item:
-          { "stream": str, "overview": str, "key_skills": [...], "career_paths": [...], "future_scope": str }
-        """
-        streams = []
+    # -------------------- Predefined mappings --------------------
+    stream_subjects = {
+        "pcm-cs": ["Physics", "Chemistry", "Mathematics", "Computer Science", "English"],
+        "pcm": ["Physics", "Chemistry", "Mathematics", "English", "Optional (CS/Economics)"],
+        "bio-math": ["Physics", "Chemistry", "Biology", "Mathematics", "English"],
+        "pcb": ["Physics", "Chemistry", "Biology", "English", "Optional (Mathematics)"],
+        "commerce-math": ["Accountancy", "Business Studies", "Economics", "Mathematics", "English"],
+        "commerce": ["Accountancy", "Business Studies", "Economics", "English", "Mathematics (optional)"],
+        "humanities": ["History", "Political Science", "Geography", "Economics", "English"],
+        "arts-design": ["Art & Craft", "Design Fundamentals", "English", "History/Cultural Studies", "Optional (Mathematics)"],
+        "vocational-it": ["Basic IT", "Computer Applications", "English", "Workplace Skills", "Mathematics (applied)"],
+        "hospitality": ["English", "Food & Nutrition Basics", "Tourism Studies", "Basic Maths", "Communication Skills"],
+        "agriculture": ["Biology (Plant/Animal basics)", "Chemistry basics", "Mathematics (applied)", "Environmental Studies", "English"]
+    }
 
-        # Prioritise suggestions from explicit interests
-        if interest_matches("computer", "coding", "programming", "ai", "machine"):
-            streams.append({
-                "stream": "PCM + Computer Science (PCM-CS)",
-                "overview": "Science stream with Mathematics and foundational Computer Science exposure — suited for students who enjoy problem solving & coding.",
-                "key_skills": ["Logical reasoning", "Mathematics", "Basic programming concepts", "Analytical thinking"],
-                "career_paths": ["B.Tech CSE / IT", "BSc (Computer Science)", "Data Science", "Software Developer"],
-                "future_scope": "Strong demand in software, AI, startups, and research; flexible for interdisciplinary paths."
-            })
-        # Add other common streams
-        streams.append({
-            "stream": "PCM (Engineering-focused)",
-            "overview": "Traditional science stream focused on Physics, Chemistry and Mathematics — a general foundation for engineering disciplines.",
-            "key_skills": ["Mathematics", "Physics fundamentals", "Problem solving", "Analytical thinking"],
-            "career_paths": ["Engineering (various branches)", "Civil/Mechanical/Electrical Engineer", "R&D roles"],
-            "future_scope": "Broad engineering opportunities in manufacturing, infrastructure, automotive, and product design."
-        })
-        streams.append({
-            "stream": "PCB + Maths (Bio + Maths hybrid)",
-            "overview": "Biology-centric stream augmented with Mathematics for students interested in biotech, bioinformatics or computational biology.",
-            "key_skills": ["Biology basics", "Mathematics", "Statistical thinking", "Laboratory skills"],
-            "career_paths": ["Biotechnology", "Bioinformatics", "Research in life sciences", "Healthcare analytics"],
-            "future_scope": "Growing intersection of biology and data science — roles in pharma, biotech startups, and research labs."
-        })
-        streams.append({
-            "stream": "PCB (Pure Biology / Medicine track)",
-            "overview": "Biology-heavy stream for students aiming at medical, allied health and biological sciences careers.",
-            "key_skills": ["Anatomy & physiology basics", "Lab techniques", "Observation skills", "Biological reasoning"],
-            "career_paths": ["MBBS / BDS / BSc Nursing / Allied Health", "Research in life sciences"],
-            "future_scope": "Traditional medical and allied health careers; steady demand in hospitals, clinics and research institutions."
-        })
-        streams.append({
-            "stream": "Commerce (Accountancy & Business)",
-            "overview": "Commerce stream focusing on accounting, economics and business studies — suited for finance, business, and management interests.",
-            "key_skills": ["Numeracy", "Basic accounting", "Business awareness", "Analytical thinking"],
-            "career_paths": ["Chartered Accountant", "Financial Analyst", "Business Management", "Banking"],
-            "future_scope": "Strong demand in finance, accounting, fintech and corporate roles; good for entrepreneurial routes."
-        })
-        streams.append({
-            "stream": "Commerce + Maths (Economics / Finance heavy)",
-            "overview": "Commerce with Mathematics to enable analytical and quantitative careers (economics, finance, data in commerce).",
-            "key_skills": ["Statistics", "Mathematical reasoning", "Economics basics", "Data interpretation"],
-            "career_paths": ["Economist (academia/industry)", "Quantitative Finance", "Data roles in finance"],
-            "future_scope": "Good fit for analytics-heavy finance roles and competitive commerce streams."
-        })
-        streams.append({
-            "stream": "Arts / Humanities (Social Sciences)",
-            "overview": "Humanities-focused stream for interests in social sciences, languages, history, and creative fields.",
-            "key_skills": ["Critical thinking", "Communication", "Research", "Cultural understanding"],
-            "career_paths": ["Law", "Public Policy", "Journalism", "Academia", "Social Work"],
-            "future_scope": "Flexible career paths across public sector, NGOs, media and academia."
-        })
-        streams.append({
-            "stream": "Arts - Design & Creative (Fine arts, Design foundation)",
-            "overview": "Focus on art, design fundamentals and creative skills — suitable for students inclined toward visual arts and design thinking.",
-            "key_skills": ["Visual design", "Sketching", "Creativity", "Design thinking"],
-            "career_paths": ["Graphic Designer", "Product Designer", "Animator", "Fashion / Textile Design"],
-            "future_scope": "Growing opportunities in product design, UI/UX, animation, advertising and creative startups."
-        })
-        streams.append({
-            "stream": "Vocational / IT (Skill-based diplomas)",
-            "overview": "Skill and career-oriented stream that focuses on vocational training, IT diplomas and practical skills for earlier employment.",
-            "key_skills": ["Basic IT skills", "Hands-on technical training", "Soft skills", "Domain-specific tools"],
-            "career_paths": ["Diploma in IT / Polytechnic routes", "Technical support", "Web developer (entry-level)"],
-            "future_scope": "Fast route to technical jobs, apprenticeships, and industry-specific roles; good for hands-on learners."
-        })
-        streams.append({
-            "stream": "Hospitality / Agriculture / Allied Sciences",
-            "overview": "Applied streams focusing on hospitality management, agriculture sciences, or allied vocational areas.",
-            "key_skills": ["Operational skills", "Domain-specific techniques", "Customer-facing abilities"],
-            "career_paths": ["Hospitality manager", "Agricultural scientist", "Food technologist"],
-            "future_scope": "Steady regional and national demand; good for industry-specific careers and entrepreneurship."
-        })
-
-        # Tailor ordering slightly by top trait
-        if top_trait == "openness":
-            # emphasize creative/novel paths earlier
-            streams = sorted(streams, key=lambda x: 0 if "Design" in x["stream"] or "openness" else 1)
-        return streams[:10]
-
-    def generate_for_12th():
-        """
-        Return 10 course suggestions. Each item:
-          { "course": str, "overview": str, "curriculum": {...}, "top_colleges": [...], "career_opportunities": [...], "eligibility": {...} }
-        """
-        items = []
-
-        # B.Tech / CSE
-        items.append({
-            "course": "B.Tech / B.E. — Computer Science & Engineering (CSE)",
-            "overview": "Undergraduate engineering degree focusing on computation, algorithms, systems and software engineering.",
+    predefined_courses = {
+        "b.tech cse": {
+            "overview": "Bachelor of Technology in Computer Science Engineering focuses on computation, algorithms, systems and software engineering.",
+            "key_skills": ["Programming", "Data Structures & Algorithms", "Systems", "Problem Solving"],
             "curriculum": {
-                "1st Year": ["Mathematics", "Physics", "Programming fundamentals", "Engineering drawing / basics"],
-                "2nd Year": ["Data Structures", "Discrete Maths", "Digital Logic", "Database Management"],
-                "3rd Year": ["Algorithms", "Operating Systems", "Software Engineering", "Machine Learning basics"],
-                "4th Year": ["Advanced CS electives", "Distributed Systems / Cloud", "Capstone Project", "Industry Internship"]
+                "1st Year": ["Mathematics", "Physics/Chemistry basics", "Programming fundamentals"],
+                "2nd Year": ["Data Structures", "Discrete Maths", "DBMS"],
+                "3rd Year": ["Algorithms", "Operating Systems", "Machine Learning basics"],
+                "4th Year": ["Advanced electives", "Capstone project", "Internship"]
             },
-            "top_colleges": ["IITs (various)", "NITs", "IIIT Hyderabad", "BITS Pilani", "VIT"],
-            "career_opportunities": ["Software Engineer", "Systems Developer", "Data Scientist", "ML Engineer", "Research"],
+            "top_colleges": ["IITs", "NITs", "IIITs", "BITS Pilani", "VIT"],
+            "career_opportunities": ["Software Engineer", "Systems Engineer", "Data Scientist", "DevOps Engineer"],
             "eligibility": {
-                "educational_requirements": "12th Grade with Physics, Mathematics and a second science (usually Chemistry/Computer Science).",
-                "minimum_percent": "Varies by institute (competitive admissions typically require high scores/entrance rank).",
-                "entrance_exams": ["JEE Main", "JEE Advanced (for IITs)", "Institute-specific tests (BITSAT, VITEEE)"],
-                "prerequisites": "Strong maths foundation, basic programming aptitude, logical thinking"
+                "educational_requirements": "12th with Physics & Mathematics (Chemistry optional), competitive entrance scores",
+                "entrance_exams": ["JEE Main", "JEE Advanced", "BITSAT"]
             }
-        })
-
-        # B.Sc / Data Science
-        items.append({
-            "course": "B.Sc / B.Tech — Data Science / Analytics",
-            "overview": "Interdisciplinary course combining statistics, programming, and machine learning to analyze real-world data.",
+        },
+        "mbbs": {
+            "overview": "Professional medical degree training to become a physician/doctor.",
+            "key_skills": ["Clinical knowledge", "Empathy", "Patient management", "Medical ethics"],
             "curriculum": {
-                "1st Year": ["Mathematics", "Statistics", "Programming fundamentals", "Intro to Data"],
-                "2nd Year": ["Database Management", "Data Structures", "Machine Learning foundations", "Data Visualization"],
-                "3rd Year": ["Linear Algebra", "Statistical Modeling", "Big Data tools", "Applied ML"],
-                "4th Year": ["Deep Learning", "Capstone Project", "Industry Internship", "Electives in domain analytics"]
+                "Pre-clinical": ["Anatomy", "Physiology"],
+                "Para-clinical": ["Pharmacology", "Pathology"],
+                "Clinical": ["Medicine", "Surgery"]
             },
-            "top_colleges": ["IITs (selected programs)", "IIITs", "BITS Pilani", "ISB / Universities offering specialised BSc programmes", "Top private universities"],
-            "career_opportunities": ["Data Scientist", "Data Analyst", "ML Engineer", "Business Analyst"],
-            "eligibility": {
-                "educational_requirements": "12th Grade (Science/Maths recommended).",
-                "required_subjects": ["Mathematics recommended; Computer Science helpful"],
-                "entrance_exams": ["Institute-specific tests; some universities via merit/entrance"],
-                "prerequisites": "Mathematics, basic programming, statistical aptitude"
-            }
-        })
-
-        # B.Com
-        items.append({
-            "course": "B.Com (Honours) / Commerce",
-            "overview": "Commerce undergraduate focusing on accounting, finance, economics and business law.",
-            "curriculum": {
-                "1st Year": ["Financial Accounting", "Business Economics", "Business Law basics"],
-                "2nd Year": ["Cost Accounting", "Corporate Law", "Taxation basics"],
-                "3rd Year": ["Auditing", "Financial Management", "Electives (Banking / Finance)"]
-            },
-            "top_colleges": ["SRCC (DU)", "St. Xavier's", "Loyola", "Top commerce colleges across state universities", "Private universities (varied)"],
-            "career_opportunities": ["Accountant", "Financial Analyst", "Company Secretary (further exams)"],
-            "eligibility": {
-                "educational_requirements": "12th Grade (any stream, commerce preferred).",
-                "required_subjects": ["Not strictly enforced; commerce subjects helpful"],
-                "entrance_exams": ["College-specific entrance/merit lists"],
-                "prerequisites": "Basic numeracy and interest in commerce/finance"
-            }
-        })
-
-        # B.Des
-        items.append({
-            "course": "B.Des / Design (Industrial / Product / Graphic / Fashion)",
-            "overview": "Undergraduate design degree teaching design thinking, visual language and applied creativity.",
-            "curriculum": {
-                "1st Year": ["Design fundamentals", "Drawing & Visualization", "History of Design"],
-                "2nd Year": ["Materials & Processes", "Digital Tools", "User-centred design"],
-                "3rd Year": ["Specialisation electives", "Workshops", "Industry projects"],
-                "4th Year": ["Portfolio, Thesis project, Internship", "Electives"]
-            },
-            "top_colleges": ["NID", "NIFT", "IITs (Design departments)", "Symbiosis School of Design", "Srishti Institute"],
-            "career_opportunities": ["Product Designer", "UX/UI Designer", "Graphic Designer", "Fashion Designer"],
-            "eligibility": {
-                "educational_requirements": "12th Grade (any stream).",
-                "entrance_exams": ["NID / NIFT / institute-specific entrance tests", "Portfolio rounds"],
-                "prerequisites": "Creative portfolio, design aptitude"
-            }
-        })
-
-        # MBBS / Medical
-        items.append({
-            "course": "MBBS / Medicine (for students focused on clinical careers)",
-            "overview": "Professional degree leading to clinical practice as a physician/doctor.",
-            "curriculum": {
-                "pre-clinical": ["Anatomy", "Physiology", "Biochemistry"],
-                "para-clinical": ["Pathology", "Pharmacology", "Microbiology"],
-                "clinical": ["Medicine, Surgery, Pediatrics, Obstetrics & Gynecology"],
-                "internship": ["Compulsory rotatory internship in clinical departments"]
-            },
-            "top_colleges": ["AIIMS (various)", "Top government medical colleges (varies by state)", "Private medical colleges (varied)"],
-            "career_opportunities": ["Clinician (MD/MS after MBBS)", "Public Health", "Research", "Healthcare management"],
-            "eligibility": {
-                "educational_requirements": "12th Grade with Biology, Chemistry, Physics.",
-                "entrance_exams": ["NEET-UG (national-level)"],
-                "prerequisites": "Strong biology foundation, commitment to clinical work"
-            }
-        })
-
-        # B.Arch
-        items.append({
-            "course": "B.Arch (Architecture)",
-            "overview": "Undergraduate professional degree in architecture, combining design, structure and planning.",
-            "curriculum": {
-                "1st Year": ["Design basics", "Visual representation", "Mathematics"],
-                "2nd-4th Years": ["Architectural design", "History of architecture", "Construction technology"],
-                "Final Year": ["Thesis project", "Professional practice", "Internship"]
-            },
-            "top_colleges": ["Architecture colleges under state universities", "IITs (architecture where available)", "CEPT University", "SPA / Top private institutes"],
-            "career_opportunities": ["Architect", "Urban Planner", "Interior Designer", "Conservation Specialist"],
-            "eligibility": {
-                "educational_requirements": "12th Grade with Mathematics (usually required).",
-                "entrance_exams": ["NATA / JEE Paper 2 (for some institutes)"],
-                "prerequisites": "Spatial ability, drawing skills"
-            }
-        })
-
-        # B.Sc — Life Sciences
-        items.append({
-            "course": "B.Sc — Life Sciences / Biotechnology",
-            "overview": "Undergraduate focus on biological sciences, lab skills and research fundamentals.",
-            "curriculum": {
-                "1st Year": ["Cell Biology", "Chemistry", "Biostatistics basics"],
-                "2nd Year": ["Genetics", "Microbiology", "Lab techniques"],
-                "3rd Year": ["Biotechnology applications", "Research project / internship"]
-            },
-            "top_colleges": ["Top universities with life-science programs (IISC-associated programs, Delhi University colleges, private universities)"],
-            "career_opportunities": ["Research Assistant", "Biotech industry roles", "Lab technician", "Further MSc/PhD"],
-            "eligibility": {
-                "educational_requirements": "12th Grade with Biology (preferred).",
-                "prerequisites": "Interest in lab work and research methods"
-            }
-        })
-
-        # BBA / Business
-        items.append({
-            "course": "BBA / Management (Business Administration)",
-            "overview": "Undergraduate business degree teaching management fundamentals and soft skills for corporate careers.",
-            "curriculum": {
-                "1st Year": ["Management basics", "Economics", "Business communication"],
-                "2nd Year": ["Marketing fundamentals", "Accounting", "HR basics"],
-                "3rd Year": ["Strategic Management", "Projects", "Internship"]
-            },
-            "top_colleges": ["Top private management colleges, university BBA programs, institute-specific programs"],
-            "career_opportunities": ["Business Analyst", "HR Executive", "Marketing Coordinator", "Entrepreneurship"],
-            "eligibility": {
-                "educational_requirements": "12th Grade (any stream); some institutes have entrance tests.",
-                "prerequisites": "Communication skills, basic numeracy"
-            }
-        })
-
-        # Polytechnic / Diploma applied courses
-        items.append({
-            "course": "Polytechnic / Diploma (Engineering or Applied Vocational Courses)",
-            "overview": "Shorter, practical diploma programmes that prepare students for industry roles or lateral entry into degree courses.",
-            "curriculum": {
-                "year_1": ["Fundamentals & hands-on labs"],
-                "year_2": ["Core technical subjects", "Workshops"],
-                "year_3": ["Project work", "Industry training / internship"]
-            },
-            "top_colleges": ["State polytechnic institutes, reputed private polytechnics, industrial training centres"],
-            "career_opportunities": ["Technician roles", "Diploma engineer roles", "Shop-floor engineering", "Lateral entry into degree programs"],
-            "eligibility": {
-                "educational_requirements": "10th/12th depending on the program.",
-                "prerequisites": "Interest in hands-on technical skills"
-            }
-        })
-
-        return items[:10]
-
-    def generate_for_college():
-        """
-        Return >=10 career entries for college students. Each item:
-          { "career": str, "overview": str, "roles": [...], "skills": [...], "top_companies": [...], "typical_pathway": str }
-        """
-        careers = []
-
-        careers.append({
-            "career": "Software Engineer",
-            "overview": "Develop, maintain and scale software products across platforms.",
-            "roles": ["Backend Developer", "Frontend Developer", "Full-stack Engineer", "SRE/Platform Engineer"],
-            "skills": ["Programming (Python/Java/JS/etc.)", "Data Structures & Algorithms", "System design", "Version control"],
-            "top_companies": ["Google", "Microsoft", "Amazon", "Infosys", "TCS", "Flipkart"],
-            "typical_pathway": "B.Tech / BSc in CS → Internships → Entry-level SWE → Mid/Senior roles / specialization"
-        })
-        careers.append({
-            "career": "Data Scientist / ML Engineer",
-            "overview": "Extract insights from data and build predictive models for products and business decisions.",
-            "roles": ["Data Scientist", "ML Engineer", "Research Scientist"],
-            "skills": ["Statistics", "Machine Learning", "Python / R", "SQL", "Model deployment"],
-            "top_companies": ["Amazon", "Google", "Microsoft", "Fractal Analytics", "Mu Sigma", "Accenture"],
-            "typical_pathway": "BTech / BSc + internships → Data Analyst → Data Scientist / ML Engineer"
-        })
-        careers.append({
-            "career": "Product Manager",
-            "overview": "Define product vision, coordinate engineering and design, and measure impact.",
-            "roles": ["Associate PM", "Product Manager", "Group PM", "Technical PM"],
-            "skills": ["Product sense", "Metrics & analytics", "Stakeholder management", "Market research"],
-            "top_companies": ["Google", "Amazon", "Flipkart", "Microsoft", "Swiggy"],
-            "typical_pathway": "Engineering degree / MBA / cross-functional experience → PM roles via internships or lateral moves"
-        })
-        careers.append({
-            "career": "UX / Product Designer",
-            "overview": "Design user experiences, interfaces and product workflows grounded in user research.",
-            "roles": ["UX Researcher", "UX Designer", "UI Designer", "Product Designer"],
-            "skills": ["User research", "Wireframing & prototyping", "Interaction design", "Design tools & portfolios"],
-            "top_companies": ["Google", "Adobe", "Microsoft", "Tata Consultancy Services (design teams)", "UX agencies"],
-            "typical_pathway": "B.Des / relevant portfolio → internships → junior designer → senior/product designer"
-        })
-        careers.append({
-            "career": "Management Consultant",
-            "overview": "Advise organisations on strategy, operations and growth using data and structured problem solving.",
-            "roles": ["Analyst", "Consultant", "Senior Consultant", "Engagement Manager"],
-            "skills": ["Problem solving", "Quantitative analysis", "Communication", "Domain knowledge"],
-            "top_companies": ["McKinsey", "BCG", "Bain", "Deloitte", "KPMG"],
-            "typical_pathway": "Bachelors → internships / small projects → consulting analyst → consultant; MBA common later"
-        })
-        careers.append({
-            "career": "Investment Analyst / Finance Professional",
-            "overview": "Analyze companies and markets to support investment decisions, corporate finance and advisory.",
-            "roles": ["Equity Research Analyst", "Investment Banking Analyst", "Financial Analyst"],
-            "skills": ["Financial modelling", "Accounting", "Excel", "Economic analysis"],
-            "top_companies": ["Goldman Sachs", "Morgan Stanley", "ICICI Securities", "HDFC", "JP Morgan"],
-            "typical_pathway": "B.Com / B.Tech / Economics → internships → analyst roles; CFA/CA add value"
-        })
-        careers.append({
-            "career": "Chartered Accountant / Accounting Specialist",
-            "overview": "Professional accounting, auditing, taxation and financial compliance expertise.",
-            "roles": ["CA (practice)", "Tax Consultant", "Internal Auditor", "Financial Controller"],
-            "skills": ["Accounting standards", "Taxation", "Audit procedures", "Ethics & compliance"],
-            "top_companies": ["Big 4 (Deloitte, PwC, EY, KPMG)", "Corporate finance teams", "Chartered practices"],
-            "typical_pathway": "B.Com / Article ship + CA exams → CA qualification → professional roles"
-        })
-        careers.append({
-            "career": "Clinical Doctor / Medical Specialist",
-            "overview": "Clinical practice and healthcare delivery after MBBS and specialization.",
-            "roles": ["General Physician", "Surgeon (specialized)", "Pediatrician", "Radiologist"],
-            "skills": ["Clinical knowledge", "Patient management", "Decision making", "Procedural skills"],
-            "top_companies": ["Apollo Hospitals", "Fortis Healthcare", "AIIMS (institutes)", "Multi-specialty hospitals"],
-            "typical_pathway": "MBBS → Internship → MD/MS/DM specialisation → clinical practice / research"
-        })
-        careers.append({
-            "career": "Civil / Mechanical / Electrical Engineer (Core Engineering)",
-            "overview": "Design, develop and maintain physical infrastructure or mechanical/electrical systems.",
-            "roles": ["Design Engineer", "Site Engineer", "R&D Engineer", "Maintenance Engineer"],
-            "skills": ["Domain engineering fundamentals", "CAD / simulation", "Project management", "Problem solving"],
-            "top_companies": ["L&T", "Tata Motors", "Mahindra", "Siemens", "ABB"],
-            "typical_pathway": "B.Tech → internships → campus placements / industry roles → senior engineering roles"
-        })
-        careers.append({
-            "career": "Entrepreneur / Startup Founder",
-            "overview": "Identify problems, build products/services and scale a business venture.",
-            "roles": ["Founder / Co-founder", "Product lead in startup", "Growth / Operations head"],
-            "skills": ["Risk-taking", "Product-market fit", "Fundraising basics", "Leadership"],
-            "top_companies": ["(Founders typically build their own companies) — common investors / accelerators include Sequoia India, Accel, Y Combinator alumni"],
-            "typical_pathway": "Any degree + domain expertise / internships → startup roles → founding a company"
-        })
-
-        return careers[:10]
-
-    # Generate the output according to stage
-    if stage_key == "10th":
-        results = generate_for_10th()
-        # Standardize output objects for compatibility with existing client expectations
-        final = [{"stream": r["stream"], "overview": r["overview"], "key_skills": r["key_skills"],
-                  "career_paths": r["career_paths"], "future_scope": r["future_scope"]} for r in results]
-    elif stage_key == "12th":
-        results = generate_for_12th()
-        final = []
-        for r in results:
-            final.append({
-                "course": r.get("course"),
-                "overview": r.get("overview"),
-                "curriculum": r.get("curriculum"),
-                "top_colleges": r.get("top_colleges"),
-                "career_opportunities": r.get("career_opportunities"),
-                "eligibility": r.get("eligibility")
-            })
-    else:  # college
-        results = generate_for_college()
-        final = []
-        for r in results:
-            final.append({
-                "career": r.get("career"),
-                "overview": r.get("overview"),
-                "roles": r.get("roles"),
-                "skills": r.get("skills"),
-                "top_companies": r.get("top_companies"),
-                "typical_pathway": r.get("typical_pathway")
-            })
-
-    # Ensure at least 10 items (trim/pad deterministically if needed)
-    if len(final) < 10:
-        # pad with simple deterministic suggestions derived from top_trait/interests
-        pad_source = {
-            "10th": {
-                "stream": "General Science (flexible)",
-                "overview": "Flexible science stream keeping options open for both engineering and life sciences.",
-                "key_skills": ["Mathematics", "Science reasoning"],
-                "career_paths": ["Multiple downstream choices"],
-                "future_scope": "Keeps options open for competitive engineering/medical/analytics paths."
-            },
-            "12th": {
-                "course": "Interdisciplinary / Foundation program",
-                "overview": "Foundation coursework allowing exploration across STEM/Commerce/Arts.",
-                "curriculum": {"Year1": ["Foundation modules", "Domain exploration"]},
-                "top_colleges": ["Various universities offering foundation programs"],
-                "career_opportunities": ["Flexible pathways into degree courses"],
-                "eligibility": {"educational_requirements": "12th Grade"}
-            },
-            "college": {
-                "career": "Generalist / Operations roles",
-                "overview": "Roles that use broad management and operations skills.",
-                "roles": ["Operations Executive", "Generalist"],
-                "skills": ["Coordination", "Basic analytics", "Communication"],
-                "top_companies": ["Multiple mid-size companies"],
-                "typical_pathway": "Any undergraduate degree → internships → operations roles"
-            }
+            "top_colleges": ["AIIMS", "CMC Vellore", "JIPMER"],
+            "career_opportunities": ["Clinician", "Surgeon", "Public Health Specialist"],
+            "eligibility": {"educational_requirements": "12th with PCB", "entrance_exams": ["NEET-UG"]}
         }
-        needed = 10 - len(final)
-        for _ in range(needed):
-            final.append(pad_source[stage_key])
+    }
 
-    # Save summarized OCEAN results to memory as before
+    predefined_careers = {
+        "software engineer": {
+            "overview": "Designs and builds software products and systems.",
+            "key_skills": ["Programming", "Data Structures", "System Design"],
+            "roles": ["Frontend", "Backend", "Full-stack", "SRE"],
+            "top_companies": ["TCS", "Infosys", "Wipro", "Google", "Microsoft"],
+            "eligibility": "B.Tech/BSc in CS or equivalent experience"
+        },
+        "data scientist": {
+            "overview": "Builds models to extract insights and predictions from data.",
+            "key_skills": ["Statistics", "Machine Learning", "Python/R", "SQL"],
+            "roles": ["Data Analyst", "ML Engineer", "Research Scientist"],
+            "top_companies": ["Amazon", "Google", "Fractal Analytics", "Accenture"],
+            "eligibility": "Degree in CS/Math/Stats or equivalent"
+        }
+    }
+
+    # -------------------- Helpers --------------------
+    def extract_json_array(text: str):
+        if not text:
+            return None
+        try:
+            start, end = text.index("["), text.rindex("]")
+            return json.loads(text[start:end + 1])
+        except Exception:
+            pass
+        try:
+            return json.loads(text)
+        except Exception:
+            return None
+
+    async def llm_json_object_for_course(course_name: str):
+        p = f"""For the course "{course_name}", return EXACTLY a JSON object with keys:
+"overview", "key_skills" (list), "curriculum" (dict), "top_colleges" (list), "career_opportunities" (list),
+"eligibility" (dict)."""
+        s = await generate_reply_ollama(p, model=LLM_MODEL_CAREER or LLM_MODEL)
+        m = re.search(r'(\{.*\})', s, re.DOTALL)
+        return json.loads(m.group(1)) if m else {}
+
+    async def llm_json_object_for_job(job_name: str):
+        p = f"""For the job '{job_name}', return EXACTLY a JSON object with keys:
+"overview", "key_skills" (list), "roles" (list), "top_companies" (list), "eligibility"."""
+        s = await generate_reply_ollama(p, model=LLM_MODEL_CAREER or LLM_MODEL)
+        m = re.search(r'(\{.*\})', s, re.DOTALL)
+        return json.loads(m.group(1)) if m else {}
+
+    async def llm_core_subjects_for_stream(stream_name: str):
+        p = f"""List the typical Indian 10th-grade stream subjects for '{stream_name}' as a JSON array of strings only."""
+        s = await generate_reply_ollama(p, model=LLM_MODEL_CAREER or LLM_MODEL)
+        return extract_json_array(s)
+
+    # -------------------- Stage prompt --------------------
+    if stage_key == "10th":
+        prompt = "Return EXACTLY 10 JSON objects with keys: stream, reason, overview, key_skills, future_scope, core_subjects."
+    elif stage_key == "12th":
+        prompt = "Return EXACTLY 10 JSON objects with keys: course, overview, key_skills, curriculum, top_colleges, career_opportunities, eligibility."
+    else:
+        prompt = "Return EXACTLY 10 JSON objects with keys: job, overview, key_skills, roles, top_companies, eligibility."
+
+    llm_prompt = f"""
+    You are an Indian career counsellor. Stage={stage_key}. 
+    OCEAN={raw_ocean}. Interests={interests_blob or 'not provided'}.
+    {prompt}
+    """
+
     try:
-        await memory_add(
-            [{"role": "system", "content": f"OCEAN Test Results: {raw_ocean}, Stage: {stage_key}, Interests: {interests_text}"}],
-            user_id=data.user_id,
-            metadata={"bot": "careerbot", "stage": stage_key, "ocean": raw_ocean, "interests": interests}
-        )
+        llm_reply = await generate_reply_ollama(llm_prompt, model=LLM_MODEL_CAREER or LLM_MODEL)
+        parsed = extract_json_array(llm_reply)
     except Exception:
-        logger.exception("Failed to store ocean test results in memory")
+        parsed = None
 
-    return OceanTestResponse(user_id=data.user_id, top_jobs=final)
+    # -------------------- Fallback deterministic suggestions --------------------
+    def deterministic_fallback(stage: str):
+        if stage == "10th":
+            return [{"stream": s, "reason": "Fallback", "core_subjects": stream_subjects.get(s.lower(), [])} for s in list(stream_subjects.keys())[:10]]
+        if stage == "12th":
+            return [{"course": c} for c in ["B.Tech CSE", "B.Com", "MBBS", "B.Sc Physics", "BBA", "B.Des", "B.Arch", "BA", "Polytechnic", "B.Sc Life Sciences"]]
+        return [{"job": j} for j in ["Software Engineer", "Data Scientist", "Product Manager", "Doctor", "UX Designer", "Chartered Accountant", "Entrepreneur", "Civil Engineer", "Lawyer", "Investment Banker"]]
+
+    if not isinstance(parsed, list):
+        parsed = deterministic_fallback(stage_key)
+
+    # -------------------- Process items --------------------
+    final = []
+
+    async def process_10th(item):
+        name = item.get("stream", "General Science")
+        cs = item.get("core_subjects") or stream_subjects.get(name.lower())
+        if not cs:
+            cs = await llm_core_subjects_for_stream(name) or ["English", "Maths", "Science", "Social Science"]
+        return {
+            "stream": name,
+            "reason": item.get("reason", "Suggested based on interests and traits."),
+            "core_subjects": cs,
+            "overview": item.get("overview", f"Overview for {name}."),
+            "key_skills": item.get("key_skills", ["Analytical Thinking", "Problem Solving"]),
+            "future_scope": item.get("future_scope", "Multiple pathways.")
+        }
+
+    async def process_12th(item):
+        name = item.get("course", "Unknown Course")
+        info = predefined_courses.get(name.lower(), {})
+        enriched = await llm_json_object_for_course(name) if not info else {}
+        return {
+            "course": name,
+            "overview": item.get("overview") or info.get("overview") or enriched.get("overview", f"Overview for {name}."),
+            "key_skills": item.get("key_skills") or info.get("key_skills") or enriched.get("key_skills", []),
+            "curriculum": item.get("curriculum") or info.get("curriculum") or enriched.get("curriculum", {}),
+            "top_colleges": item.get("top_colleges") or info.get("top_colleges") or enriched.get("top_colleges", []),
+            "career_opportunities": item.get("career_opportunities") or info.get("career_opportunities") or enriched.get("career_opportunities", []),
+            "eligibility": item.get("eligibility") or info.get("eligibility") or enriched.get("eligibility", {"educational_requirements": "12th Grade"})
+        }
+
+    async def process_college(item):
+        name = item.get("job", "Unknown Job")
+        info = predefined_careers.get(name.lower(), {})
+        enriched = await llm_json_object_for_job(name) if not info else {}
+        return {
+            "job": name,
+            "overview": item.get("overview") or info.get("overview") or enriched.get("overview", f"Overview for {name}."),
+            "key_skills": item.get("key_skills") or info.get("key_skills") or enriched.get("key_skills", []),
+            "roles": item.get("roles") or info.get("roles") or enriched.get("roles", []),
+            "top_companies": item.get("top_companies") or info.get("top_companies") or enriched.get("top_companies", []),
+            "eligibility": item.get("eligibility") or info.get("eligibility") or enriched.get("eligibility", "Typical requirements")
+        }
+
+    for item in parsed[:10]:
+        try:
+            if stage_key == "10th":
+                final.append(await process_10th(item))
+            elif stage_key == "12th":
+                final.append(await process_12th(item))
+            else:
+                final.append(await process_college(item))
+        except Exception:
+            continue
+
+    return OceanTestResponse(user_id=data.user_id, top_jobs=final[:10])
+
 
 # ---------------------------
 # Main entry
