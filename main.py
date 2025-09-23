@@ -140,6 +140,16 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     reply: str
 
+class OceanTestRequest(BaseModel):
+    user_id: str
+    ocean_scores: Dict[str, float]  # {"openness": 7.5, "conscientiousness": 8, ...}
+    stage: Optional[str] = None     # "school" or "college"
+    interests: Optional[List[str]] = None
+
+class OceanTestResponse(BaseModel):
+    user_id: str
+    top_jobs: List[Dict[str, Any]]
+
 # ---------------------------
 # Prompts
 # ---------------------------
@@ -160,6 +170,7 @@ CAREER_SYSTEM_PROMPT = (
     "Ask clarifying follow-ups when needed. Keep language simple and encouraging."
     "Try to keep it under a single paragraph at a time and keep the answers short"
 )
+
 # ---------------------------
 # Utils
 # ---------------------------
@@ -376,8 +387,177 @@ def health():
     return {"status": "healthy"}
 
 # ---------------------------
-# Run
+# Improved OCEAN Test endpoint
+# ---------------------------
+@app.post("/oceantest", response_model=OceanTestResponse)
+async def ocean_test_recommendations(data: OceanTestRequest):
+    """
+    Take OCEAN test scores, stage, and interests, and return top 10 job recommendations.
+    """
+    import re
+    import json
+    logger.info("Received oceantest request for user=%s stage=%s", data.user_id, data.stage)
+
+    # --- Normalize + validate OCEAN scores ---
+    raw_ocean = {k.lower(): float(v) for k, v in (data.ocean_scores or {}).items()}
+    expected = {"openness", "conscientiousness", "extraversion", "agreeableness", "neuroticism"}
+    for trait in expected:
+        raw_ocean.setdefault(trait, 0.0)
+    for k in list(raw_ocean.keys()):
+        try:
+            val = float(raw_ocean[k])
+            raw_ocean[k] = max(0.0, min(10.0, val))
+        except Exception:
+            raw_ocean[k] = 0.0
+
+    interests = data.interests or []
+    stage_text = data.stage or "not specified"
+    interests_text = ", ".join(interests) if interests else "not specified"
+
+    # Deterministic fallback
+    def deterministic_fallback(ocean_scores: Dict[str, float], interests: List[str], stage: str):
+        interest_blob = " ".join(interests).lower()
+        suggestions = []
+        mapping = {
+            "computer": ["Software Engineer", "Data Scientist", "Product Manager", "DevOps Engineer", "UX Designer"],
+            "cs": ["Software Engineer", "Data Scientist", "Product Manager", "DevOps Engineer", "UX Designer"],
+            "account": ["Accountant", "Financial Analyst", "Tax Consultant", "Auditor", "Investment Analyst"],
+            "electronics": ["Electronics Engineer", "Embedded Systems Engineer", "Hardware Engineer", "Test Engineer", "Firmware Developer"],
+            "mechanical": ["Mechanical Engineer", "Design Engineer", "Production Engineer", "Automotive Engineer", "R&D Engineer"],
+            "arts": ["Graphic Designer", "Animator", "Content Creator", "UX Designer", "Illustrator"],
+            "teaching": ["Teacher", "Counselor", "Instructional Designer", "Education Consultant", "Training Specialist"],
+        }
+        for key, lst in mapping.items():
+            if key in interest_blob:
+                suggestions.extend(lst)
+        if not suggestions:
+            top_trait = max(ocean_scores.items(), key=lambda x: x[1])[0]
+            if top_trait == "openness":
+                suggestions = ["Research Scientist", "UX Designer", "Content Creator", "Product Designer", "Entrepreneur"]
+            elif top_trait == "conscientiousness":
+                suggestions = ["Software Engineer", "Chartered Accountant", "Civil Engineer", "Data Analyst", "Lawyer"]
+            elif top_trait == "extraversion":
+                suggestions = ["Sales Manager", "Marketing Executive", "Human Resources", "Event Manager", "Business Development"]
+            elif top_trait == "agreeableness":
+                suggestions = ["Counselor", "Teacher", "Nurse", "Social Worker", "HR Specialist"]
+            else:
+                suggestions = ["Lab Technician", "Quality Analyst", "Data Entry Specialist", "Customer Support (non high-stress)", "Research Assistant"]
+        sorted_traits = sorted(ocean_scores.items(), key=lambda x: x[1], reverse=True)
+        top_two = ", ".join([f"{t.capitalize()}({v}/10)" for t, v in sorted_traits[:2]])
+        out = []
+        seen = set()
+        for job in suggestions:
+            if job in seen:
+                continue
+            seen.add(job)
+            reason = f"Matches interests: {interests_text}. Top traits: {top_two}."
+            out.append({"job": job, "reason": reason})
+            if len(out) >= 10:
+                break
+        return out
+
+    # Build LLM prompt
+    prompt = f"""
+You are an Indian career counsellor. Based on the user's OCEAN scores, stage, and interests, return EXACTLY a JSON array
+(with no extra text) containing 10 objects. Each object must have keys:
+  - "job": string
+  - "reason": short 1-2 sentence explanation referencing the user's traits and interests
+
+User profile:
+Stage: {stage_text}
+OCEAN Scores:
+{chr(10).join(f"- {k.capitalize()}: {v}/10" for k, v in raw_ocean.items())}
+Interests: {interests_text}
+
+Return ONLY the JSON array (no headings, no explanation). Example:
+[
+  {{"job": "Software Engineer", "reason": "Reason ..."}},
+  ...
+]
+Limit to 10 items.
+"""
+    model_override = LLM_MODEL_CAREER or LLM_MODEL
+    try:
+        reply = await generate_reply_ollama(prompt, model=model_override)
+        logger.debug("LLM reply for oceantest: %s", reply[:1000])
+    except Exception:
+        logger.exception("LLM call failed for oceantest")
+        reply = ""
+
+    # JSON extraction
+    def extract_json(text: str):
+        if not text:
+            return None
+        m = re.search(r'(\[.*\])', text, flags=re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(1))
+            except Exception:
+                pass
+        m2 = re.search(r'(\{.*\})', text, flags=re.DOTALL)
+        if m2:
+            try:
+                obj = json.loads(m2.group(1))
+                return [obj]
+            except Exception:
+                pass
+        decoder = json.JSONDecoder()
+        s = text.strip()
+        for start in range(0, min(200, len(s))):
+            try:
+                obj, idx = decoder.raw_decode(s[start:])
+                return obj if isinstance(obj, list) else [obj]
+            except Exception:
+                continue
+        return None
+
+    parsed = extract_json(reply)
+    top_jobs = []
+    if isinstance(parsed, list):
+        for elem in parsed:
+            if isinstance(elem, dict) and "job" in elem:
+                job = str(elem.get("job")).strip()
+                reason = str(elem.get("reason") or "").strip() or "Recommended based on the profile."
+                top_jobs.append({"job": job, "reason": reason})
+            elif isinstance(elem, str) and elem.strip():
+                top_jobs.append({"job": elem.strip(), "reason": "Recommended based on profile."})
+    else:
+        logger.warning("Could not parse JSON from LLM reply; using deterministic fallback")
+        top_jobs = deterministic_fallback(raw_ocean, interests, stage_text)
+
+    if len(top_jobs) > 10:
+        top_jobs = top_jobs[:10]
+    elif len(top_jobs) < 10:
+        needed = 5 - len(top_jobs)
+        fallback = deterministic_fallback(raw_ocean, interests, stage_text)
+        existing = {t["job"] for t in top_jobs}
+        for f in fallback:
+            if f["job"] not in existing:
+                top_jobs.append(f)
+                existing.add(f["job"])
+            if len(top_jobs) >= 10:
+                break
+
+    final = []
+    for item in top_jobs:
+        job = str(item.get("job", "Unknown")).strip()
+        reason = str(item.get("reason", "")).strip() or "Suggested based on the user's profile."
+        final.append({"job": job, "reason": reason})
+
+    try:
+        await memory_add(
+            [{"role": "system", "content": f"OCEAN Test Results: {raw_ocean}, Stage: {stage_text}, Interests: {interests_text}"}],
+            user_id=data.user_id,
+            metadata={"bot": "careerbot", "stage": stage_text, "ocean": raw_ocean, "interests": interests}
+        )
+    except Exception:
+        logger.exception("Failed to store ocean test results in memory")
+
+    return OceanTestResponse(user_id=data.user_id, top_jobs=final)
+
+# ---------------------------
+# Main entry
 # ---------------------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host=APP_HOST, port=APP_PORT, reload=DEBUG)
+    uvicorn.run(app, host=APP_HOST, port=APP_PORT, log_level="debug" if DEBUG else "info")
