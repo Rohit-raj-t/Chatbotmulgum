@@ -12,6 +12,10 @@ import os
 import asyncio
 import logging
 from typing import List, Dict, Any, Optional
+import re
+import json
+from collections import Counter
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
@@ -392,6 +396,9 @@ def health():
 # ---------------------------
 # Improved OCEAN Test endpoint (robust, LLM-enrichment for missing fields)
 # ---------------------------
+
+
+
 @app.post("/oceantest", response_model=OceanTestResponse)
 async def ocean_test_recommendations(data: OceanTestRequest):
     """
@@ -400,7 +407,6 @@ async def ocean_test_recommendations(data: OceanTestRequest):
     - 12th and below -> courses with curriculum, colleges, eligibility
     - college -> careers/jobs with roles, companies, eligibility
     """
-    import re, json
     logger.info("Received oceantest request for user=%s stage=%s", data.user_id, data.stage)
 
     # -------------------- Normalize OCEAN scores --------------------
@@ -410,15 +416,12 @@ async def ocean_test_recommendations(data: OceanTestRequest):
             raw_ocean[str(k).lower()] = float(v)
         except Exception:
             raw_ocean[str(k).lower()] = 0.0
-
     for trait in ("openness", "conscientiousness", "extraversion", "agreeableness", "neuroticism"):
         raw_ocean.setdefault(trait, 0.0)
-    # map shorthand O C E A N
     mapping = {"o": "openness", "c": "conscientiousness", "e": "extraversion", "a": "agreeableness", "n": "neuroticism"}
     for short, full in mapping.items():
         if short in raw_ocean and raw_ocean.get(full, 0.0) == 0.0:
             raw_ocean[full] = raw_ocean[short]
-    # clamp to [0,10]
     for k in list(raw_ocean.keys()):
         try:
             raw_ocean[k] = max(0.0, min(10.0, float(raw_ocean[k])))
@@ -427,12 +430,12 @@ async def ocean_test_recommendations(data: OceanTestRequest):
 
     interests = [str(i).strip() for i in (data.interests or [])]
     interests_blob = " ".join(i.lower() for i in interests)
+
     stage_raw = (data.stage or "").strip().lower()
 
     # -------------------- Normalize stage --------------------
     def normalize_stage(s: str) -> str:
-        if not s:
-            return "12th"
+        if not s: return "12th"
         if any(tok in s for tok in ("10", "10th", "ssc", "secondary", "class 10", "class10")):
             return "10th"
         if any(tok in s for tok in ("11", "11th", "12", "12th", "hsc", "higher secondary", "class 11", "class 12", "12th and below")):
@@ -476,18 +479,6 @@ async def ocean_test_recommendations(data: OceanTestRequest):
                 "educational_requirements": "12th with Physics & Mathematics (Chemistry optional), competitive entrance scores",
                 "entrance_exams": ["JEE Main", "JEE Advanced", "BITSAT"]
             }
-        },
-        "mbbs": {
-            "overview": "Professional medical degree training to become a physician/doctor.",
-            "key_skills": ["Clinical knowledge", "Empathy", "Patient management", "Medical ethics"],
-            "curriculum": {
-                "Pre-clinical": ["Anatomy", "Physiology"],
-                "Para-clinical": ["Pharmacology", "Pathology"],
-                "Clinical": ["Medicine", "Surgery"]
-            },
-            "top_colleges": ["AIIMS", "CMC Vellore", "JIPMER"],
-            "career_opportunities": ["Clinician", "Surgeon", "Public Health Specialist"],
-            "eligibility": {"educational_requirements": "12th with PCB", "entrance_exams": ["NEET-UG"]}
         }
     }
 
@@ -498,20 +489,11 @@ async def ocean_test_recommendations(data: OceanTestRequest):
             "roles": ["Frontend", "Backend", "Full-stack", "SRE"],
             "top_companies": ["TCS", "Infosys", "Wipro", "Google", "Microsoft"],
             "eligibility": "B.Tech/BSc in CS or equivalent experience"
-        },
-        "data scientist": {
-            "overview": "Builds models to extract insights and predictions from data.",
-            "key_skills": ["Statistics", "Machine Learning", "Python/R", "SQL"],
-            "roles": ["Data Analyst", "ML Engineer", "Research Scientist"],
-            "top_companies": ["Amazon", "Google", "Fractal Analytics", "Accenture"],
-            "eligibility": "Degree in CS/Math/Stats or equivalent"
         }
     }
 
-    # -------------------- Helpers --------------------
     def extract_json_array(text: str):
-        if not text:
-            return None
+        if not text: return None
         try:
             start, end = text.index("["), text.rindex("]")
             return json.loads(text[start:end + 1])
@@ -523,16 +505,13 @@ async def ocean_test_recommendations(data: OceanTestRequest):
             return None
 
     async def llm_json_object_for_course(course_name: str):
-        p = f"""For the course "{course_name}", return EXACTLY a JSON object with keys:
-"overview", "key_skills" (list), "curriculum" (dict), "top_colleges" (list), "career_opportunities" (list),
-"eligibility" (dict)."""
+        p = f"""For the course \"{course_name}\", return EXACTLY a JSON object with keys: \"overview\", \"key_skills\" (list), \"curriculum\" (dict), \"top_colleges\" (list), \"career_opportunities\" (list), \"eligibility\" (dict)."""
         s = await generate_reply_ollama(p, model=LLM_MODEL_CAREER or LLM_MODEL)
         m = re.search(r'(\{.*\})', s, re.DOTALL)
         return json.loads(m.group(1)) if m else {}
 
     async def llm_json_object_for_job(job_name: str):
-        p = f"""For the job '{job_name}', return EXACTLY a JSON object with keys:
-"overview", "key_skills" (list), "roles" (list), "top_companies" (list), "eligibility"."""
+        p = f"""For the job '{job_name}', return EXACTLY a JSON object with keys: \"overview\", \"key_skills\" (list), \"roles\" (list), \"top_companies\" (list), \"eligibility\"."""
         s = await generate_reply_ollama(p, model=LLM_MODEL_CAREER or LLM_MODEL)
         m = re.search(r'(\{.*\})', s, re.DOTALL)
         return json.loads(m.group(1)) if m else {}
@@ -542,7 +521,6 @@ async def ocean_test_recommendations(data: OceanTestRequest):
         s = await generate_reply_ollama(p, model=LLM_MODEL_CAREER or LLM_MODEL)
         return extract_json_array(s)
 
-    # -------------------- Stage prompt --------------------
     if stage_key == "10th":
         prompt = "Return EXACTLY 10 JSON objects with keys: stream, reason, overview, key_skills, future_scope, core_subjects."
     elif stage_key == "12th":
@@ -551,7 +529,7 @@ async def ocean_test_recommendations(data: OceanTestRequest):
         prompt = "Return EXACTLY 10 JSON objects with keys: job, overview, key_skills, roles, top_companies, eligibility."
 
     llm_prompt = f"""
-    You are an Indian career counsellor. Stage={stage_key}. 
+    You are an Indian career counsellor. Stage={stage_key}.
     OCEAN={raw_ocean}. Interests={interests_blob or 'not provided'}.
     {prompt}
     """
@@ -562,7 +540,6 @@ async def ocean_test_recommendations(data: OceanTestRequest):
     except Exception:
         parsed = None
 
-    # -------------------- Fallback deterministic suggestions --------------------
     def deterministic_fallback(stage: str):
         if stage == "10th":
             return [{"stream": s, "reason": "Fallback", "core_subjects": stream_subjects.get(s.lower(), [])} for s in list(stream_subjects.keys())[:10]]
@@ -573,7 +550,6 @@ async def ocean_test_recommendations(data: OceanTestRequest):
     if not isinstance(parsed, list):
         parsed = deterministic_fallback(stage_key)
 
-    # -------------------- Process items --------------------
     final = []
 
     async def process_10th(item):
@@ -594,12 +570,19 @@ async def ocean_test_recommendations(data: OceanTestRequest):
         name = item.get("course", "Unknown Course")
         info = predefined_courses.get(name.lower(), {})
         enriched = await llm_json_object_for_course(name) if not info else {}
+        # embed best colleges from web search
+        best_colleges = []
+        try:
+            hits = await web_search_ddgs(f"top colleges in India for {name}", max_results=5)
+            best_colleges = [f"{h.get('title')} ({h.get('href') or h.get('url')})" for h in hits]
+        except Exception:
+            pass
         return {
             "course": name,
             "overview": item.get("overview") or info.get("overview") or enriched.get("overview", f"Overview for {name}."),
             "key_skills": item.get("key_skills") or info.get("key_skills") or enriched.get("key_skills", []),
             "curriculum": item.get("curriculum") or info.get("curriculum") or enriched.get("curriculum", {}),
-            "top_colleges": item.get("top_colleges") or info.get("top_colleges") or enriched.get("top_colleges", []),
+            "top_colleges": best_colleges or item.get("top_colleges") or info.get("top_colleges") or enriched.get("top_colleges", []),
             "career_opportunities": item.get("career_opportunities") or info.get("career_opportunities") or enriched.get("career_opportunities", []),
             "eligibility": item.get("eligibility") or info.get("eligibility") or enriched.get("eligibility", {"educational_requirements": "12th Grade"})
         }
