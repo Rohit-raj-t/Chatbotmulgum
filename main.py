@@ -393,49 +393,59 @@ def health():
 # ---------------------------
 # Improved OCEAN Test endpoint
 # ---------------------------
+
 # ---------------------------
-# Improved OCEAN Test endpoint (robust, LLM-enrichment for missing fields)
+# Improved OCEAN Test endpoint with caching
 # ---------------------------
 
-
+from functools import lru_cache
 
 @app.post("/oceantest", response_model=OceanTestResponse)
 async def ocean_test_recommendations(data: OceanTestRequest):
     """
     Take OCEAN test scores, stage, and interests, and return top 10 recommendations.
-    - 10th and below -> streams with core_subjects
-    - 12th and below -> courses with curriculum, colleges, eligibility
-    - college -> careers/jobs with roles, companies, eligibility
+    - 10th and below -> canonical Indian streams (pcm-cs, pcm, pcmb, pcb, pcb-cs, commerce-math, commerce, accountancy, humanities, arts-design, ...)
+      Deterministic / scored; NO LLM calls for 10th to keep consistent and fast.
+    - 12th and below -> courses with curriculum, colleges (context only), eligibility (single LLM call for the list; enrichment cached)
+    - college -> careers/jobs with roles, companies, eligibility (single LLM call for the list; enrichment cached)
+    Includes per-request caching for enrichment so repeated names in same request don't re-call LLM.
     """
+    import re, json, httpx
+    from typing import Dict, Any, List
+
     logger.info("Received oceantest request for user=%s stage=%s", data.user_id, data.stage)
 
     # -------------------- Normalize OCEAN scores --------------------
-    raw_ocean = {}
+    raw_ocean: Dict[str, float] = {}
     for k, v in (data.ocean_scores or {}).items():
         try:
             raw_ocean[str(k).lower()] = float(v)
         except Exception:
             raw_ocean[str(k).lower()] = 0.0
+
     for trait in ("openness", "conscientiousness", "extraversion", "agreeableness", "neuroticism"):
         raw_ocean.setdefault(trait, 0.0)
+    # map shorthand O C E A N
     mapping = {"o": "openness", "c": "conscientiousness", "e": "extraversion", "a": "agreeableness", "n": "neuroticism"}
     for short, full in mapping.items():
         if short in raw_ocean and raw_ocean.get(full, 0.0) == 0.0:
             raw_ocean[full] = raw_ocean[short]
+    # clamp to [0,10]
     for k in list(raw_ocean.keys()):
         try:
             raw_ocean[k] = max(0.0, min(10.0, float(raw_ocean[k])))
         except Exception:
             raw_ocean[k] = 0.0
 
-    interests = [str(i).strip() for i in (data.interests or [])]
-    interests_blob = " ".join(i.lower() for i in interests)
+    interests = [str(i).strip().lower() for i in (data.interests or [])]
+    interests_blob = " ".join(interests)
 
     stage_raw = (data.stage or "").strip().lower()
 
     # -------------------- Normalize stage --------------------
     def normalize_stage(s: str) -> str:
-        if not s: return "12th"
+        if not s:
+            return "12th"
         if any(tok in s for tok in ("10", "10th", "ssc", "secondary", "class 10", "class10")):
             return "10th"
         if any(tok in s for tok in ("11", "11th", "12", "12th", "hsc", "higher secondary", "class 11", "class 12", "12th and below")):
@@ -448,21 +458,42 @@ async def ocean_test_recommendations(data: OceanTestRequest):
 
     stage_key = normalize_stage(stage_raw)
 
-    # -------------------- Predefined mappings --------------------
+    # -------------------- Canonical 10th streams & their core subjects --------------------
+    # Keys are canonical stream IDs used in output (lowercase)
     stream_subjects = {
-        "pcm-cs": ["Physics", "Chemistry", "Mathematics", "Computer Science", "English"],
-        "pcm": ["Physics", "Chemistry", "Mathematics", "English", "Optional (CS/Economics)"],
-        "bio-math": ["Physics", "Chemistry", "Biology", "Mathematics", "English"],
-        "pcb": ["Physics", "Chemistry", "Biology", "English", "Optional (Mathematics)"],
-        "commerce-math": ["Accountancy", "Business Studies", "Economics", "Mathematics", "English"],
-        "commerce": ["Accountancy", "Business Studies", "Economics", "English", "Mathematics (optional)"],
-        "humanities": ["History", "Political Science", "Geography", "Economics", "English"],
-        "arts-design": ["Art & Craft", "Design Fundamentals", "English", "History/Cultural Studies", "Optional (Mathematics)"],
-        "vocational-it": ["Basic IT", "Computer Applications", "English", "Workplace Skills", "Mathematics (applied)"],
-        "hospitality": ["English", "Food & Nutrition Basics", "Tourism Studies", "Basic Maths", "Communication Skills"],
-        "agriculture": ["Biology (Plant/Animal basics)", "Chemistry basics", "Mathematics (applied)", "Environmental Studies", "English"]
+        "PCM-CS": ["Physics", "Chemistry", "Mathematics", "Computer Science", "English"],   # PCM with CS
+        "PCM": ["Physics", "Chemistry", "Mathematics", "English", "Optional (CS/Economics)"],
+        "PCMB": ["Physics", "Chemistry", "Mathematics", "Biology", "English"],             # PCMB (both Maths & Bio)
+        "PCB": ["Physics", "Chemistry", "Biology", "English", "Optional (Mathematics)"],
+        "PCB-CS": ["Physics", "Chemistry", "Biology", "Computer Science", "English"],      # PCB + CS hybrid (occasionally chosen)
+        "Commerce-Math": ["Accountancy", "Business Studies", "Economics", "Mathematics", "English"],
+        "Commerce": ["Accountancy", "Business Studies", "Economics", "English", "Mathematics (optional)"],
+        "Accountancy": ["Accountancy", "Business Studies", "Economics", "English", "Mathematics (optional)"],  # explicit
+        "Humanities": ["History", "Political Science", "Geography", "Economics", "English"],
+        "Arts-Design": ["Art & Craft", "Design Fundamentals", "English", "History/Cultural Studies", "Optional (Mathematics)"],
+        "Vocational-IT": ["Basic IT", "Computer Applications", "English", "Workplace Skills", "Mathematics (applied)"],
+        "Hospitality": ["English", "Food & Nutrition Basics", "Tourism Studies", "Basic Maths", "Communication Skills"],
+        "Agriculture": ["Biology (Plant/Animal basics)", "Chemistry basics", "Mathematics (applied)", "Environmental Studies", "English"]
     }
 
+    # Keywords mapping to canonical streams (used when interests are specific)
+    stream_interest_keywords = {
+        "PCM": {"math", "physics", "chemistry", "engineering", "problem", "algorithms"},
+        "PCM-CS": {"programming", "computer", "coding", "algorithms", "software", "math"},
+        "PCMB": {"math", "biology", "both", "pcmb", "both math biology", "bio+math"},
+        "PCB": {"biology", "medicine", "bio", "neuroscience", "chemistry"},
+        "PCV-CS": {"biology", "computer", "bioit", "bioinformatics", "programming"},
+        "Commerce": {"business", "accountancy", "economics", "money", "finance", "commerce"},
+        "Commerce-Math": {"finance", "math", "accounts", "economics", "commerce"},
+        "Accountancy": {"account", "accounts", "accountancy", "auditing"},
+        "Humanities": {"history", "political", "geography", "society", "law", "humanities"},
+        "Arts-Design": {"art", "design", "creative", "drawing", "animation", "fashion"},
+        "Vocational-IT": {"it", "computer", "office", "applications", "support"},
+        "Hospitality": {"hotel", "tourism", "travel", "service", "cooking", "hospitality"},
+        "Agriculture": {"agri", "farming", "agriculture", "plants", "animals"}
+    }
+
+    # -------------------- Predefined fallback course/career templates --------------------
     predefined_courses = {
         "b.tech cse": {
             "overview": "Bachelor of Technology in Computer Science Engineering focuses on computation, algorithms, systems and software engineering.",
@@ -473,12 +504,15 @@ async def ocean_test_recommendations(data: OceanTestRequest):
                 "3rd Year": ["Algorithms", "Operating Systems", "Machine Learning basics"],
                 "4th Year": ["Advanced electives", "Capstone project", "Internship"]
             },
-            "top_colleges": ["IITs", "NITs", "IIITs", "BITS Pilani", "VIT"],
             "career_opportunities": ["Software Engineer", "Systems Engineer", "Data Scientist", "DevOps Engineer"],
-            "eligibility": {
-                "educational_requirements": "12th with Physics & Mathematics (Chemistry optional), competitive entrance scores",
-                "entrance_exams": ["JEE Main", "JEE Advanced", "BITSAT"]
-            }
+            "eligibility": {"educational_requirements": "12th with Physics & Mathematics (Chemistry optional)", "entrance_exams": ["JEE Main", "JEE Advanced", "BITSAT"]}
+        },
+        "mbbs": {
+            "overview": "Professional medical degree training to become a physician/doctor.",
+            "key_skills": ["Clinical knowledge", "Empathy", "Patient management", "Medical ethics"],
+            "curriculum": {"Pre-clinical": ["Anatomy", "Physiology"], "Para-clinical": ["Pharmacology", "Pathology"], "Clinical": ["Medicine", "Surgery"]},
+            "career_opportunities": ["Clinician", "Surgeon", "Public Health Specialist"],
+            "eligibility": {"educational_requirements": "12th with PCB", "entrance_exams": ["NEET-UG"]}
         }
     }
 
@@ -492,8 +526,10 @@ async def ocean_test_recommendations(data: OceanTestRequest):
         }
     }
 
+    # -------------------- Helpers --------------------
     def extract_json_array(text: str):
-        if not text: return None
+        if not text:
+            return None
         try:
             start, end = text.index("["), text.rindex("]")
             return json.loads(text[start:end + 1])
@@ -504,35 +540,166 @@ async def ocean_test_recommendations(data: OceanTestRequest):
         except Exception:
             return None
 
-    async def llm_json_object_for_course(course_name: str):
-        p = f"""For the course \"{course_name}\", return EXACTLY a JSON object with keys: \"overview\", \"key_skills\" (list), \"curriculum\" (dict), \"top_colleges\" (list), \"career_opportunities\" (list), \"eligibility\" (dict)."""
-        s = await generate_reply_ollama(p, model=LLM_MODEL_CAREER or LLM_MODEL)
-        m = re.search(r'(\{.*\})', s, re.DOTALL)
-        return json.loads(m.group(1)) if m else {}
+    # per-request caches (avoid duplicate LLM calls within same request)
+    course_enrich_cache: Dict[str, Dict[str, Any]] = {}
+    job_enrich_cache: Dict[str, Dict[str, Any]] = {}
 
-    async def llm_json_object_for_job(job_name: str):
-        p = f"""For the job '{job_name}', return EXACTLY a JSON object with keys: \"overview\", \"key_skills\" (list), \"roles\" (list), \"top_companies\" (list), \"eligibility\"."""
+    async def llm_json_object_for_course_cached(course_name: str):
+        key = course_name.lower().strip()
+        if key in course_enrich_cache:
+            return course_enrich_cache[key]
+        p = f"""For the course "{course_name}", return EXACTLY a JSON object with keys:
+"overview", "key_skills" (list), "curriculum" (dict), "career_opportunities" (list), "eligibility" (dict)."""
         s = await generate_reply_ollama(p, model=LLM_MODEL_CAREER or LLM_MODEL)
         m = re.search(r'(\{.*\})', s, re.DOTALL)
-        return json.loads(m.group(1)) if m else {}
+        try:
+            obj = json.loads(m.group(1)) if m else {}
+        except Exception:
+            obj = {}
+        course_enrich_cache[key] = obj
+        return obj
+
+    async def llm_json_object_for_job_cached(job_name: str):
+        key = job_name.lower().strip()
+        if key in job_enrich_cache:
+            return job_enrich_cache[key]
+        p = f"""For the job '{job_name}', return EXACTLY a JSON object with keys:
+"overview", "key_skills" (list), "roles" (list), "top_companies" (list), "eligibility"."""
+        s = await generate_reply_ollama(p, model=LLM_MODEL_CAREER or LLM_MODEL)
+        m = re.search(r'(\{.*\})', s, re.DOTALL)
+        try:
+            obj = json.loads(m.group(1)) if m else {}
+        except Exception:
+            obj = {}
+        job_enrich_cache[key] = obj
+        return obj
 
     async def llm_core_subjects_for_stream(stream_name: str):
         p = f"""List the typical Indian 10th-grade stream subjects for '{stream_name}' as a JSON array of strings only."""
         s = await generate_reply_ollama(p, model=LLM_MODEL_CAREER or LLM_MODEL)
         return extract_json_array(s)
 
+    # -------------------- NIRF / government-colleges as prompt context (single fetch) --------------------
+    top_colleges_reference: List[str] = []
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.get("https://www.nirfindia.org/Rankings/2025/Ranking.html")
+            html = r.text
+        matches = re.findall(r'<td[^>]*class[^>]*institution[^>]*>(.*?)</td>', html, re.DOTALL | re.IGNORECASE)
+        if not matches:
+            matches = re.findall(r'<td[^>]*>([^<]*IIT[^<]*|[^<]*NIT[^<]*|[^<]*University[^<]*)</td>', html, re.DOTALL | re.IGNORECASE)
+        cleaned = []
+        for m in matches:
+            text = re.sub(r'<.*?>', '', m).strip()
+            if text and len(text) > 3:
+                cleaned.append(text)
+        govt_candidates = [c for c in cleaned if any(x.lower() in c.lower() for x in ("iit", "nit", "iiit", "central university", "aiims", "iisc", "jipmer"))]
+        if not govt_candidates:
+            govt_candidates = cleaned[:15]
+        top_colleges_reference = govt_candidates[:15]
+    except Exception:
+        top_colleges_reference = ["IIT Delhi", "IIT Bombay", "IIT Madras", "IIT Kanpur", "IIT Kharagpur", "IIT Roorkee", "IIT Guwahati", "IIT BHU", "NIT Trichy", "NIT Surathkal"]
+
+    top_colleges_prompt_context = "Top government institutes (NIRF-preferred): " + ", ".join(top_colleges_reference[:10])
+
+    # -------------------- Stage-specific behavior --------------------
+    final: List[Dict[str, Any]] = []
+
+    # ---------- 10th: deterministic canonical streams (no LLM) ----------
     if stage_key == "10th":
-        prompt = "Return EXACTLY 10 JSON objects with keys: stream, reason, overview, key_skills, future_scope, core_subjects."
-    elif stage_key == "12th":
-        prompt = "Return EXACTLY 10 JSON objects with keys: course, overview, key_skills, curriculum, top_colleges, career_opportunities, eligibility."
+        # If interests are empty or 'general', return canonical recommended order (commonly used in India)
+        if (not interests) or ("general" in interests):
+            canonical_order = [
+                "PCM-CS",      # PCM + Computer Science
+                "PCM",         # PCM
+                "PCMB",        # PCMB (both Maths & Bio)
+                "PCB",         # PCB
+                "PCB-CS",      # PCB + CS (hybrid)
+                "Commerce-Math",
+                "Commerce",
+                "Accountancy",
+                "Humanities",
+                "Arts-Design"
+            ]
+            for s in canonical_order[:10]:
+                core = stream_subjects.get(s, ["English", "Mathematics", "Science"])
+                result = {
+                    "stream": s,
+                    "reason": f"Recommended as a common Indian 10th stream option: {s}.",
+                    "core_subjects": core,
+                    "overview": f"Overview for {s}.",
+                    "key_skills": ["Analytical Thinking", "Problem Solving"] if s.lower().startswith("pcm") or s in ("pcmb", "pcb") else ["Communication", "Creativity"],
+                    "future_scope": "Multiple pathways (higher education, vocational training, professional courses)."
+                }
+                final.append(result)
+            return OceanTestResponse(user_id=data.user_id, top_jobs=final[:10])
+
+        # Otherwise compute simple scoring based on interests + trait heuristics
+        def score_stream(stream_key: str) -> float:
+            score = 0.0
+            kws = stream_interest_keywords.get(stream_key, set())
+            if interests:
+                # 2 points per keyword match
+                score += 2.0 * len(kws.intersection(set(interests)))
+            # Add small OCEAN heuristics
+            o = raw_ocean.get("openness", 0.0)
+            c = raw_ocean.get("conscientiousness", 0.0)
+            e = raw_ocean.get("extraversion", 0.0)
+            a = raw_ocean.get("agreeableness", 0.0)
+            n = raw_ocean.get("neuroticism", 0.0)
+            # Heuristic boosts
+            if stream_key in ("arts-design",) and o >= 6.0:
+                score += 1.5
+            if stream_key in ("pcm", "pcm-cs", "pcmb", "pcb") and c >= 5.0:
+                score += 1.0
+            if stream_key in ("hospitality", "vocational-it") and e >= 6.0:
+                score += 1.0
+            if stream_key in ("humanities", "commerce", "accountancy") and a >= 5.0:
+                score += 0.8
+            # small negative bias if neuroticism is high for hardcore technical streams
+            if n >= 7.0 and stream_key in ("pcm-cs", "pcm", "pcb"):
+                score -= 0.5
+            return score
+
+        scored = []
+        for key in stream_subjects.keys():
+            scored.append((score_stream(key), key))
+        scored.sort(reverse=True, key=lambda x: x[0])
+
+        top_streams = [k for _, k in scored][:10]
+
+        for s in top_streams:
+            core = stream_subjects.get(s, ["English", "Mathematics", "Science"])
+            result = {
+                "stream": s,
+                "reason": f"Suggested because your interest/trait profile aligns with the stream '{s}'.",
+                "core_subjects": core,
+                "overview": f"Overview for {s}.",
+                "key_skills": ["Analytical Thinking", "Problem Solving"] if s.startswith("pcm") or s in ("pcmb", "pcb") else ["Communication", "Critical Thinking"],
+                "future_scope": "Multiple pathways (higher education, vocational training, professional courses)."
+            }
+            final.append(result)
+
+        return OceanTestResponse(user_id=data.user_id, top_jobs=final[:10])
+
+    # ---------- 12th or college: single LLM call for 10 items (with top_colleges_prompt_context only used as prompt context) ----------
+    if stage_key == "12th":
+        llm_required_keys = ["course", "overview", "key_skills", "curriculum", "career_opportunities", "eligibility"]
+        stage_instruction = "Return EXACTLY 10 JSON objects with keys: " + ", ".join(llm_required_keys) + "."
     else:
-        prompt = "Return EXACTLY 10 JSON objects with keys: job, overview, key_skills, roles, top_companies, eligibility."
+        llm_required_keys = ["job", "overview", "key_skills", "roles", "top_companies", "eligibility"]
+        stage_instruction = "Return EXACTLY 10 JSON objects with keys: " + ", ".join(llm_required_keys) + "."
 
     llm_prompt = f"""
-    You are an Indian career counsellor. Stage={stage_key}.
-    OCEAN={raw_ocean}. Interests={interests_blob or 'not provided'}.
-    {prompt}
-    """
+You are an Indian career counsellor. Stage={stage_key}.
+OCEAN={raw_ocean}.
+Interests={interests_blob or 'not provided'}.
+Context (do not expose raw links in the API response): {top_colleges_prompt_context}
+
+Instruction: {stage_instruction}
+When listing colleges (if relevant), prioritize government institutes (IITs, NITs, IIITs, central universities) from the provided context.
+Return pure JSON (an array of objects) and nothing else.
+"""
 
     try:
         llm_reply = await generate_reply_ollama(llm_prompt, model=LLM_MODEL_CAREER or LLM_MODEL)
@@ -540,79 +707,77 @@ async def ocean_test_recommendations(data: OceanTestRequest):
     except Exception:
         parsed = None
 
-    def deterministic_fallback(stage: str):
-        if stage == "10th":
-            return [{"stream": s, "reason": "Fallback", "core_subjects": stream_subjects.get(s.lower(), [])} for s in list(stream_subjects.keys())[:10]]
-        if stage == "12th":
-            return [{"course": c} for c in ["B.Tech CSE", "B.Com", "MBBS", "B.Sc Physics", "BBA", "B.Des", "B.Arch", "BA", "Polytechnic", "B.Sc Life Sciences"]]
-        return [{"job": j} for j in ["Software Engineer", "Data Scientist", "Product Manager", "Doctor", "UX Designer", "Chartered Accountant", "Entrepreneur", "Civil Engineer", "Lawyer", "Investment Banker"]]
-
+    # fallback deterministic
     if not isinstance(parsed, list):
-        parsed = deterministic_fallback(stage_key)
+        if stage_key == "12th":
+            parsed = [{"course": c} for c in ["B.Tech CSE", "B.Com", "MBBS", "B.Sc Physics", "BBA", "B.Des", "B.Arch", "BA", "Polytechnic", "B.Sc Life Sciences"]]
+        else:
+            parsed = [{"job": j} for j in ["Software Engineer", "Data Scientist", "Doctor", "Lawyer", "UX Designer", "Chartered Accountant", "Civil Engineer", "Teacher", "Product Manager", "Entrepreneur"]]
 
-    final = []
-
-    async def process_10th(item):
-        name = item.get("stream", "General Science")
-        cs = item.get("core_subjects") or stream_subjects.get(name.lower())
-        if not cs:
-            cs = await llm_core_subjects_for_stream(name) or ["English", "Maths", "Science", "Social Science"]
-        return {
-            "stream": name,
-            "reason": item.get("reason", "Suggested based on interests and traits."),
-            "core_subjects": cs,
-            "overview": item.get("overview", f"Overview for {name}."),
-            "key_skills": item.get("key_skills", ["Analytical Thinking", "Problem Solving"]),
-            "future_scope": item.get("future_scope", "Multiple pathways.")
-        }
-
-    async def process_12th(item):
-        name = item.get("course", "Unknown Course")
-        info = predefined_courses.get(name.lower(), {})
-        enriched = await llm_json_object_for_course(name) if not info else {}
-        # embed best colleges from web search
-        best_colleges = []
-        try:
-            hits = await web_search_ddgs(f"top colleges in India for {name}", max_results=5)
-            best_colleges = [f"{h.get('title')} ({h.get('href') or h.get('url')})" for h in hits]
-        except Exception:
-            pass
-        return {
-            "course": name,
-            "overview": item.get("overview") or info.get("overview") or enriched.get("overview", f"Overview for {name}."),
-            "key_skills": item.get("key_skills") or info.get("key_skills") or enriched.get("key_skills", []),
-            "curriculum": item.get("curriculum") or info.get("curriculum") or enriched.get("curriculum", {}),
-            "top_colleges": best_colleges or item.get("top_colleges") or info.get("top_colleges") or enriched.get("top_colleges", []),
-            "career_opportunities": item.get("career_opportunities") or info.get("career_opportunities") or enriched.get("career_opportunities", []),
-            "eligibility": item.get("eligibility") or info.get("eligibility") or enriched.get("eligibility", {"educational_requirements": "12th Grade"})
-        }
-
-    async def process_college(item):
-        name = item.get("job", "Unknown Job")
-        info = predefined_careers.get(name.lower(), {})
-        enriched = await llm_json_object_for_job(name) if not info else {}
-        return {
-            "job": name,
-            "overview": item.get("overview") or info.get("overview") or enriched.get("overview", f"Overview for {name}."),
-            "key_skills": item.get("key_skills") or info.get("key_skills") or enriched.get("key_skills", []),
-            "roles": item.get("roles") or info.get("roles") or enriched.get("roles", []),
-            "top_companies": item.get("top_companies") or info.get("top_companies") or enriched.get("top_companies", []),
-            "eligibility": item.get("eligibility") or info.get("eligibility") or enriched.get("eligibility", "Typical requirements")
-        }
-
+    # Process parsed items and enrich with cached LLM calls when necessary (no top_colleges list in output)
     for item in parsed[:10]:
         try:
-            if stage_key == "10th":
-                final.append(await process_10th(item))
-            elif stage_key == "12th":
-                final.append(await process_12th(item))
-            else:
-                final.append(await process_college(item))
+            if stage_key == "12th":
+                name = item.get("course") or item.get("title") or "Unknown Course"
+                info = predefined_courses.get(name.lower(), {})
+                # If the LLM already returned the fields, trust them (except top_colleges which we drop)
+                if any(k in item for k in ("overview", "key_skills", "curriculum", "career_opportunities", "eligibility")):
+                    overview = item.get("overview") or info.get("overview", f"Overview for {name}.")
+                    key_skills = item.get("key_skills") or info.get("key_skills", [])
+                    curriculum = item.get("curriculum") or info.get("curriculum", {})
+                    career_ops = item.get("career_opportunities") or info.get("career_opportunities", [])
+                    eligibility = item.get("eligibility") or info.get("eligibility", {"educational_requirements": "12th Grade"})
+                else:
+                    enriched = await llm_json_object_for_course_cached(name)
+                    overview = enriched.get("overview") or info.get("overview", f"Overview for {name}.")
+                    key_skills = enriched.get("key_skills") or info.get("key_skills", [])
+                    curriculum = enriched.get("curriculum") or info.get("curriculum", {})
+                    career_ops = enriched.get("career_opportunities") or info.get("career_opportunities", [])
+                    eligibility = enriched.get("eligibility") or info.get("eligibility", {"educational_requirements": "12th Grade"})
+
+                response_item = {
+                    "course": name,
+                    "overview": overview,
+                    "key_skills": key_skills,
+                    "curriculum": curriculum,
+                    # intentionally DO NOT include top_colleges list/links in API output per request
+                    "career_opportunities": career_ops,
+                    "eligibility": eligibility
+                }
+                final.append(response_item)
+
+            else:  # college stage: jobs/careers
+                name = item.get("job") or item.get("title") or "Unknown Job"
+                info = predefined_careers.get(name.lower(), {})
+                if any(k in item for k in ("overview", "key_skills", "roles", "top_companies", "eligibility")):
+                    overview = item.get("overview") or info.get("overview", f"Overview for {name}.")
+                    key_skills = item.get("key_skills") or info.get("key_skills", [])
+                    roles = item.get("roles") or info.get("roles", [])
+                    top_companies = item.get("top_companies") or info.get("top_companies", [])
+                    eligibility = item.get("eligibility") or info.get("eligibility", "Typical requirements")
+                else:
+                    enriched = await llm_json_object_for_job_cached(name)
+                    overview = enriched.get("overview") or info.get("overview", f"Overview for {name}.")
+                    key_skills = enriched.get("key_skills") or info.get("key_skills", [])
+                    roles = enriched.get("roles") or info.get("roles", [])
+                    top_companies = enriched.get("top_companies") or info.get("top_companies", [])
+                    eligibility = enriched.get("eligibility") or info.get("eligibility", "Typical requirements")
+
+                response_item = {
+                    "job": name,
+                    "overview": overview,
+                    "key_skills": key_skills,
+                    "roles": roles,
+                    "top_companies": top_companies,
+                    "eligibility": eligibility
+                }
+                final.append(response_item)
+
         except Exception:
+            logger.exception("Failed to process item: %s", item)
             continue
 
     return OceanTestResponse(user_id=data.user_id, top_jobs=final[:10])
-
 
 # ---------------------------
 # Main entry
