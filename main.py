@@ -398,13 +398,11 @@ def health():
 # Improved OCEAN Test endpoint with caching
 # ---------------------------
 
-from functools import lru_cache
-
 @app.post("/oceantest", response_model=OceanTestResponse)
 async def ocean_test_recommendations(data: OceanTestRequest):
     """
     Take OCEAN test scores, stage, and interests, and return top 10 recommendations.
-    - 10th and below -> canonical Indian streams (pcm-cs, pcm, pcmb, pcb, pcb-cs, commerce-math, commerce, accountancy, humanities, arts-design, ...)
+    - 10th and below -> canonical Indian streams (PCM-CS, PCM, PCMB, PCB, PCB-CS, COMMERCE-MATH, COMMERCE, ACCOUNTANCY, HUMANITIES, ARTS-DESIGN, ...)
       Deterministic / scored; NO LLM calls for 10th to keep consistent and fast.
     - 12th and below -> courses with curriculum, colleges (context only), eligibility (single LLM call for the list; enrichment cached)
     - college -> careers/jobs with roles, companies, eligibility (single LLM call for the list; enrichment cached)
@@ -437,7 +435,8 @@ async def ocean_test_recommendations(data: OceanTestRequest):
         except Exception:
             raw_ocean[k] = 0.0
 
-    interests = [str(i).strip().lower() for i in (data.interests or [])]
+    # Normalize interests to UPPERCASE so they match UPPERCASE keyword sets below
+    interests = [str(i).strip().upper() for i in (data.interests or [])]
     interests_blob = " ".join(interests)
 
     stage_raw = (data.stage or "").strip().lower()
@@ -459,38 +458,38 @@ async def ocean_test_recommendations(data: OceanTestRequest):
     stage_key = normalize_stage(stage_raw)
 
     # -------------------- Canonical 10th streams & their core subjects --------------------
-    # Keys are canonical stream IDs used in output (lowercase)
+    # Keys are canonical stream IDs used in output (UPPERCASE)
     stream_subjects = {
         "PCM-CS": ["Physics", "Chemistry", "Mathematics", "Computer Science", "English"],   # PCM with CS
         "PCM": ["Physics", "Chemistry", "Mathematics", "English", "Optional (CS/Economics)"],
         "PCMB": ["Physics", "Chemistry", "Mathematics", "Biology", "English"],             # PCMB (both Maths & Bio)
         "PCB": ["Physics", "Chemistry", "Biology", "English", "Optional (Mathematics)"],
-        "PCB-CS": ["Physics", "Chemistry", "Biology", "Computer Science", "English"],      # PCB + CS hybrid (occasionally chosen)
-        "Commerce-Math": ["Accountancy", "Business Studies", "Economics", "Mathematics", "English"],
-        "Commerce": ["Accountancy", "Business Studies", "Economics", "English", "Mathematics (optional)"],
-        "Accountancy": ["Accountancy", "Business Studies", "Economics", "English", "Mathematics (optional)"],  # explicit
-        "Humanities": ["History", "Political Science", "Geography", "Economics", "English"],
-        "Arts-Design": ["Art & Craft", "Design Fundamentals", "English", "History/Cultural Studies", "Optional (Mathematics)"],
-        "Vocational-IT": ["Basic IT", "Computer Applications", "English", "Workplace Skills", "Mathematics (applied)"],
-        "Hospitality": ["English", "Food & Nutrition Basics", "Tourism Studies", "Basic Maths", "Communication Skills"],
-        "Agriculture": ["Biology (Plant/Animal basics)", "Chemistry basics", "Mathematics (applied)", "Environmental Studies", "English"]
+        "PCB-CS": ["Physics", "Chemistry", "Biology", "Computer Science", "English"],      # PCB + CS hybrid
+        "COMMERCE-MATH": ["Accountancy", "Business Studies", "Economics", "Mathematics", "English"],
+        "COMMERCE": ["Accountancy", "Business Studies", "Economics", "English", "Mathematics (optional)"],
+        "ACCOUNTANCY": ["Accountancy", "Business Studies", "Economics", "English", "Mathematics (optional)"],
+        "HUMANITIES": ["History", "Political Science", "Geography", "Economics", "English"],
+        "ARTS-DESIGN": ["Art & Craft", "Design Fundamentals", "English", "History/Cultural Studies", "Optional (Mathematics)"],
+        "VOCATIONAL-IT": ["Basic IT", "Computer Applications", "English", "Workplace Skills", "Mathematics (applied)"],
+        "HOSPITALITY": ["English", "Food & Nutrition Basics", "Tourism Studies", "Basic Maths", "Communication Skills"],
+        "AGRICULTURE": ["Biology (Plant/Animal basics)", "Chemistry basics", "Mathematics (applied)", "Environmental Studies", "English"]
     }
 
-    # Keywords mapping to canonical streams (used when interests are specific)
+    # Keywords mapping to canonical streams (keys are UPPERCASE)
     stream_interest_keywords = {
-        "PCM": {"math", "physics", "chemistry", "engineering", "problem", "algorithms"},
-        "PCM-CS": {"programming", "computer", "coding", "algorithms", "software", "math"},
-        "PCMB": {"math", "biology", "both", "pcmb", "both math biology", "bio+math"},
-        "PCB": {"biology", "medicine", "bio", "neuroscience", "chemistry"},
-        "PCV-CS": {"biology", "computer", "bioit", "bioinformatics", "programming"},
-        "Commerce": {"business", "accountancy", "economics", "money", "finance", "commerce"},
-        "Commerce-Math": {"finance", "math", "accounts", "economics", "commerce"},
-        "Accountancy": {"account", "accounts", "accountancy", "auditing"},
-        "Humanities": {"history", "political", "geography", "society", "law", "humanities"},
-        "Arts-Design": {"art", "design", "creative", "drawing", "animation", "fashion"},
-        "Vocational-IT": {"it", "computer", "office", "applications", "support"},
-        "Hospitality": {"hotel", "tourism", "travel", "service", "cooking", "hospitality"},
-        "Agriculture": {"agri", "farming", "agriculture", "plants", "animals"}
+        "PCM": {"MATH", "PHYSICS", "CHEMISTRY", "ENGINEERING", "PROBLEM", "ALGORITHMS"},
+        "PCM-CS": {"PROGRAMMING", "COMPUTER", "CODING", "ALGORITHMS", "SOFTWARE", "MATH"},
+        "PCMB": {"MATH", "BIOLOGY", "BOTH", "PCMB", "BOTH MATH BIOLOGY", "BIO+MATH"},
+        "PCB": {"BIOLOGY", "MEDICINE", "BIO", "NEUROSCIENCE", "CHEMISTRY"},
+        "PCB-CS": {"BIOLOGY", "COMPUTER", "BIOIT", "BIOINFORMATICS", "PROGRAMMING"},
+        "COMMERCE": {"BUSINESS", "ACCOUNTANCY", "ECONOMICS", "MONEY", "FINANCE", "COMMERCE"},
+        "COMMERCE-MATH": {"FINANCE", "MATH", "ACCOUNTS", "ECONOMICS", "COMMERCE"},
+        "ACCOUNTANCY": {"ACCOUNT", "ACCOUNTS", "ACCOUNTANCY", "AUDITING"},
+        "HUMANITIES": {"HISTORY", "POLITICAL", "GEOGRAPHY", "SOCIETY", "LAW", "HUMANITIES"},
+        "ARTS-DESIGN": {"ART", "DESIGN", "CREATIVE", "DRAWING", "ANIMATION", "FASHION"},
+        "VOCATIONAL-IT": {"IT", "COMPUTER", "OFFICE", "APPLICATIONS", "SUPPORT"},
+        "HOSPITALITY": {"HOTEL", "TOURISM", "TRAVEL", "SERVICE", "COOKING", "HOSPITALITY"},
+        "AGRICULTURE": {"AGRI", "FARMING", "AGRICULTURE", "PLANTS", "ANIMALS"}
     }
 
     # -------------------- Predefined fallback course/career templates --------------------
@@ -564,7 +563,7 @@ async def ocean_test_recommendations(data: OceanTestRequest):
         if key in job_enrich_cache:
             return job_enrich_cache[key]
         p = f"""For the job '{job_name}', return EXACTLY a JSON object with keys:
-"overview", "key_skills" (list), "roles" (list), "top_companies" (list), "eligibility"."""
+"overview", "key_skills" (list), "roles" (list), "top_companies" (list), "eligibility" (dict)."""
         s = await generate_reply_ollama(p, model=LLM_MODEL_CAREER or LLM_MODEL)
         m = re.search(r'(\{.*\})', s, re.DOTALL)
         try:
@@ -607,19 +606,19 @@ async def ocean_test_recommendations(data: OceanTestRequest):
 
     # ---------- 10th: deterministic canonical streams (no LLM) ----------
     if stage_key == "10th":
-        # If interests are empty or 'general', return canonical recommended order (commonly used in India)
-        if (not interests) or ("general" in interests):
+        # If interests are empty or 'GENERAL', return canonical recommended order (commonly used in India)
+        if (not interests) or ("GENERAL" in interests):
             canonical_order = [
                 "PCM-CS",      # PCM + Computer Science
                 "PCM",         # PCM
                 "PCMB",        # PCMB (both Maths & Bio)
                 "PCB",         # PCB
                 "PCB-CS",      # PCB + CS (hybrid)
-                "Commerce-Math",
-                "Commerce",
-                "Accountancy",
-                "Humanities",
-                "Arts-Design"
+                "COMMERCE-MATH",
+                "COMMERCE",
+                "ACCOUNTANCY",
+                "HUMANITIES",
+                "ARTS-DESIGN"
             ]
             for s in canonical_order[:10]:
                 core = stream_subjects.get(s, ["English", "Mathematics", "Science"])
@@ -628,7 +627,7 @@ async def ocean_test_recommendations(data: OceanTestRequest):
                     "reason": f"Recommended as a common Indian 10th stream option: {s}.",
                     "core_subjects": core,
                     "overview": f"Overview for {s}.",
-                    "key_skills": ["Analytical Thinking", "Problem Solving"] if s.lower().startswith("pcm") or s in ("pcmb", "pcb") else ["Communication", "Creativity"],
+                    "key_skills": ["Analytical Thinking", "Problem Solving"] if (s.startswith("PCM") or s in ("PCMB", "PCB")) else ["Communication", "Creativity"],
                     "future_scope": "Multiple pathways (higher education, vocational training, professional courses)."
                 }
                 final.append(result)
@@ -636,8 +635,9 @@ async def ocean_test_recommendations(data: OceanTestRequest):
 
         # Otherwise compute simple scoring based on interests + trait heuristics
         def score_stream(stream_key: str) -> float:
+            skey = stream_key.upper()
             score = 0.0
-            kws = stream_interest_keywords.get(stream_key, set())
+            kws = stream_interest_keywords.get(skey, set())
             if interests:
                 # 2 points per keyword match
                 score += 2.0 * len(kws.intersection(set(interests)))
@@ -647,17 +647,17 @@ async def ocean_test_recommendations(data: OceanTestRequest):
             e = raw_ocean.get("extraversion", 0.0)
             a = raw_ocean.get("agreeableness", 0.0)
             n = raw_ocean.get("neuroticism", 0.0)
-            # Heuristic boosts
-            if stream_key in ("arts-design",) and o >= 6.0:
+            # Heuristic boosts (use UPPERCASE keys)
+            if skey == "ARTS-DESIGN" and o >= 6.0:
                 score += 1.5
-            if stream_key in ("pcm", "pcm-cs", "pcmb", "pcb") and c >= 5.0:
+            if skey in ("PCM", "PCM-CS", "PCMB", "PCB") and c >= 5.0:
                 score += 1.0
-            if stream_key in ("hospitality", "vocational-it") and e >= 6.0:
+            if skey in ("HOSPITALITY", "VOCATIONAL-IT") and e >= 6.0:
                 score += 1.0
-            if stream_key in ("humanities", "commerce", "accountancy") and a >= 5.0:
+            if skey in ("HUMANITIES", "COMMERCE", "ACCOUNTANCY") and a >= 5.0:
                 score += 0.8
             # small negative bias if neuroticism is high for hardcore technical streams
-            if n >= 7.0 and stream_key in ("pcm-cs", "pcm", "pcb"):
+            if n >= 7.0 and skey in ("PCM-CS", "PCM", "PCB"):
                 score -= 0.5
             return score
 
@@ -675,7 +675,7 @@ async def ocean_test_recommendations(data: OceanTestRequest):
                 "reason": f"Suggested because your interest/trait profile aligns with the stream '{s}'.",
                 "core_subjects": core,
                 "overview": f"Overview for {s}.",
-                "key_skills": ["Analytical Thinking", "Problem Solving"] if s.startswith("pcm") or s in ("pcmb", "pcb") else ["Communication", "Critical Thinking"],
+                "key_skills": ["Analytical Thinking", "Problem Solving"] if (s.startswith("PCM") or s in ("PCMB", "PCB")) else ["Communication", "Critical Thinking"],
                 "future_scope": "Multiple pathways (higher education, vocational training, professional courses)."
             }
             final.append(result)
